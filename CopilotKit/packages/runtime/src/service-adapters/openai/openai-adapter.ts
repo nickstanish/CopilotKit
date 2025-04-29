@@ -118,6 +118,16 @@ export class OpenAIAdapter implements CopilotServiceAdapter {
     const threadId = threadIdFromRequest ?? randomUUID();
 
     let openaiMessages = messages.map((m) => convertMessageToOpenAIMessage(m));
+
+    // Filter out any tool messages that don't have matching tool calls
+    // This prevents the "messages with role 'tool' must be a response to a preceeding message with 'tool_calls'" error
+    openaiMessages = openaiMessages.filter((msg) => {
+      if (msg.role !== "tool") return true;
+      return openaiMessages.some(
+        (m) => m.role === "assistant" && m.tool_calls?.some((tc) => tc.id === msg.tool_call_id),
+      );
+    });
+
     openaiMessages = limitMessagesToTokenCount(openaiMessages, tools, model);
 
     let toolChoice: any = forwardedParameters?.toolChoice;
