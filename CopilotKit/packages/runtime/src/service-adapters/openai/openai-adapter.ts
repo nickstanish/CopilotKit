@@ -119,14 +119,148 @@ export class OpenAIAdapter implements CopilotServiceAdapter {
 
     let openaiMessages = messages.map((m) => convertMessageToOpenAIMessage(m));
 
-    // Filter out any tool messages that don't have matching tool calls
-    // This prevents the "messages with role 'tool' must be a response to a preceeding message with 'tool_calls'" error
-    openaiMessages = openaiMessages.filter((msg) => {
-      if (msg.role !== "tool") return true;
-      return openaiMessages.some(
-        (m) => m.role === "assistant" && m.tool_calls?.some((tc) => tc.id === msg.tool_call_id),
-      );
-    });
+    // Debug logging to help trace the issue
+    // TODO: Remove debug logging once the fix is confirmed
+    console.log(
+      "BEFORE FILTERING - Message structure:",
+      openaiMessages.map((msg, i) => ({
+        index: i,
+        role: msg.role,
+        tool_call_id: msg.role === "tool" ? msg.tool_call_id : undefined,
+        has_tool_calls: msg.role === "assistant" && !!msg.tool_calls,
+        tool_call_ids:
+          msg.role === "assistant" && msg.tool_calls
+            ? msg.tool_calls.map((tc) => tc.id)
+            : undefined,
+      })),
+    );
+
+    // Enhanced filtering for message sequence validation
+    // Two-pass algorithm to guarantee valid message ordering
+
+    // First pass: Map tool calls and their positions
+    const toolCallPositions = new Map();
+    const processedToolResponses = new Set();
+
+    // Track all assistant tool calls and their positions
+    for (let i = 0; i < openaiMessages.length; i++) {
+      const msg = openaiMessages[i];
+      if (msg.role === "assistant" && msg.tool_calls) {
+        for (const toolCall of msg.tool_calls) {
+          if (toolCall.id) {
+            toolCallPositions.set(toolCall.id, i);
+          }
+        }
+      }
+    }
+
+    // Second pass: Build properly ordered message list
+    const reorderedMessages = [];
+
+    // Process messages in order
+    for (let i = 0; i < openaiMessages.length; i++) {
+      const msg = openaiMessages[i];
+
+      if (msg.role === "tool") {
+        const toolCallId = msg.tool_call_id;
+
+        // Skip if we don't have this tool call ID or we've already processed a response for it
+        if (!toolCallPositions.has(toolCallId) || processedToolResponses.has(toolCallId)) {
+          console.warn(
+            `Skipping tool message with ID ${toolCallId} - ${
+              !toolCallPositions.has(toolCallId)
+                ? "no matching tool call found"
+                : "duplicate response"
+            }`,
+          );
+          continue;
+        }
+
+        // Check if this tool response appears after its corresponding tool call
+        const toolCallPos = toolCallPositions.get(toolCallId);
+        if (toolCallPos >= i) {
+          console.warn(
+            `Filtering out of order tool message with ID ${toolCallId} - tool call at pos ${toolCallPos}, response at ${i}`,
+          );
+          continue;
+        }
+
+        // Valid tool response
+        reorderedMessages.push(msg);
+        processedToolResponses.add(toolCallId);
+      } else {
+        // Non-tool messages are always included
+        reorderedMessages.push(msg);
+      }
+    }
+
+    // Use our reordered messages
+    openaiMessages = reorderedMessages;
+
+    // Final validation pass - make sure we don't have any remaining invalid sequences
+    // This ensures that even after our filtering, the message sequence is valid
+    try {
+      // Check if any 'tool' message exists without a preceding matching tool call
+      const finalToolCallIds = new Set();
+      const invalidToolResponses = [];
+
+      for (let i = 0; i < openaiMessages.length; i++) {
+        const msg = openaiMessages[i];
+
+        if (msg.role === "assistant" && msg.tool_calls) {
+          for (const toolCall of msg.tool_calls) {
+            if (toolCall.id) finalToolCallIds.add(toolCall.id);
+          }
+        } else if (msg.role === "tool") {
+          // For each tool message, verify there is a preceding tool call with matching ID
+          const toolCallId = msg.tool_call_id;
+
+          // If this ID isn't in our set, or we haven't seen a tool call with this ID before this message,
+          // then this is an invalid tool response
+          let hasPrecedingToolCall = false;
+
+          for (let j = 0; j < i; j++) {
+            const prevMsg = openaiMessages[j];
+            if (prevMsg.role === "assistant" && prevMsg.tool_calls) {
+              if (prevMsg.tool_calls.some((tc) => tc.id === toolCallId)) {
+                hasPrecedingToolCall = true;
+                break;
+              }
+            }
+          }
+
+          if (!hasPrecedingToolCall) {
+            invalidToolResponses.push(i);
+          }
+        }
+      }
+
+      // Remove any invalid tool responses we found in our final check
+      if (invalidToolResponses.length > 0) {
+        console.warn(
+          `Final validation found ${invalidToolResponses.length} invalid tool responses, removing them`,
+        );
+        openaiMessages = openaiMessages.filter((_, i) => !invalidToolResponses.includes(i));
+      }
+    } catch (e) {
+      console.error("Error during final message validation:", e);
+    }
+
+    // Debug logging after filtering
+    // TODO: Remove debug logging once the fix is confirmed
+    console.log(
+      "AFTER FILTERING - Message structure:",
+      openaiMessages.map((msg, i) => ({
+        index: i,
+        role: msg.role,
+        tool_call_id: msg.role === "tool" ? msg.tool_call_id : undefined,
+        has_tool_calls: msg.role === "assistant" && !!msg.tool_calls,
+        tool_call_ids:
+          msg.role === "assistant" && msg.tool_calls
+            ? msg.tool_calls.map((tc) => tc.id)
+            : undefined,
+      })),
+    );
 
     openaiMessages = limitMessagesToTokenCount(openaiMessages, tools, model);
 
