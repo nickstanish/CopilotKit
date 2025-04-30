@@ -140,7 +140,7 @@ export class OpenAIAdapter implements CopilotServiceAdapter {
 
     // First pass: Map tool calls and their positions
     const toolCallPositions = new Map();
-    const processedToolResponses = new Set();
+    const toolResponseMap = new Map();
 
     // Track all assistant tool calls and their positions
     for (let i = 0; i < openaiMessages.length; i++) {
@@ -154,45 +154,68 @@ export class OpenAIAdapter implements CopilotServiceAdapter {
       }
     }
 
-    // Second pass: Build properly ordered message list
-    const reorderedMessages = [];
-
-    // Process messages in order
+    // Second pass: Collect all tool responses by ID (including duplicates)
     for (let i = 0; i < openaiMessages.length; i++) {
       const msg = openaiMessages[i];
-
-      if (msg.role === "tool") {
-        const toolCallId = msg.tool_call_id;
-
-        // Skip if we don't have this tool call ID or we've already processed a response for it
-        if (!toolCallPositions.has(toolCallId) || processedToolResponses.has(toolCallId)) {
-          console.warn(
-            `Skipping tool message with ID ${toolCallId} - ${
-              !toolCallPositions.has(toolCallId)
-                ? "no matching tool call found"
-                : "duplicate response"
-            }`,
-          );
-          continue;
+      if (msg.role === "tool" && msg.tool_call_id) {
+        if (!toolResponseMap.has(msg.tool_call_id)) {
+          toolResponseMap.set(msg.tool_call_id, []);
         }
+        // Store the message along with its position
+        toolResponseMap.get(msg.tool_call_id).push({ msg, position: i });
+      }
+    }
 
-        // Check if this tool response appears after its corresponding tool call
-        const toolCallPos = toolCallPositions.get(toolCallId);
-        if (toolCallPos >= i) {
-          console.warn(
-            `Filtering out of order tool message with ID ${toolCallId} - tool call at pos ${toolCallPos}, response at ${i}`,
-          );
-          continue;
-        }
+    // Build the reordered message list
+    const reorderedMessages = [];
 
-        // Valid tool response
-        reorderedMessages.push(msg);
-        processedToolResponses.add(toolCallId);
-      } else {
-        // Non-tool messages are always included
+    // Process non-tool messages first
+    for (let i = 0; i < openaiMessages.length; i++) {
+      const msg = openaiMessages[i];
+      if (msg.role !== "tool") {
         reorderedMessages.push(msg);
       }
     }
+
+    // Now process tool messages, selecting only one response per tool call
+    for (const [toolCallId, responses] of Array.from(toolResponseMap.entries())) {
+      // Skip if no matching tool call found
+      if (!toolCallPositions.has(toolCallId)) {
+        console.warn(`Skipping tool message with ID ${toolCallId} - no matching tool call found`);
+        continue;
+      }
+
+      const toolCallPos = toolCallPositions.get(toolCallId);
+
+      // Skip responses that appear before their corresponding tool call
+      const validResponses = responses.filter((r) => r.position > toolCallPos);
+
+      if (validResponses.length === 0) {
+        console.warn(`No valid tool responses found for tool call ID ${toolCallId}`);
+        continue;
+      }
+
+      // If we have multiple valid responses, select the one with content
+      // Sort by content length as a basic heuristic (longer response might have more information)
+      validResponses.sort((a, b) => {
+        const aContentLength = a.msg.content ? a.msg.content.length : 0;
+        const bContentLength = b.msg.content ? b.msg.content.length : 0;
+        return bContentLength - aContentLength; // Descending order
+      });
+
+      // Add the best response
+      reorderedMessages.push(validResponses[0].msg);
+      console.log(
+        `Selected 1 response out of ${validResponses.length} for tool call ID ${toolCallId}`,
+      );
+    }
+
+    // Sort the messages to maintain the original order
+    reorderedMessages.sort((a, b) => {
+      const aIndex = openaiMessages.indexOf(a);
+      const bIndex = openaiMessages.indexOf(b);
+      return aIndex - bIndex;
+    });
 
     // Use our reordered messages
     openaiMessages = reorderedMessages;

@@ -159,6 +159,55 @@ export function convertMessageToAnthropicMessage(
 export function groupAnthropicMessagesByRole(
   messageParams: Anthropic.Messages.MessageParam[],
 ): Anthropic.Messages.MessageParam[] {
+  // First, handle duplicate tool results by keeping only one result per tool_use_id
+  const toolResultsMap = new Map<string, any[]>();
+
+  // Collect all tool results by their tool_use_id
+  messageParams.forEach((message) => {
+    if (message.role === "user" && Array.isArray(message.content)) {
+      message.content.forEach((contentItem) => {
+        if (contentItem.type === "tool_result" && contentItem.tool_use_id) {
+          if (!toolResultsMap.has(contentItem.tool_use_id)) {
+            toolResultsMap.set(contentItem.tool_use_id, []);
+          }
+          toolResultsMap.get(contentItem.tool_use_id).push({
+            message,
+            contentItem,
+            contentLength: contentItem.content ? JSON.stringify(contentItem.content).length : 0,
+          });
+        }
+      });
+    }
+  });
+
+  // For each tool_use_id with multiple results, keep only the one with the most content
+  const duplicateResults = Array.from(toolResultsMap.entries()).filter(
+    ([_, results]) => results.length > 1,
+  );
+
+  if (duplicateResults.length > 0) {
+    console.log(`Found ${duplicateResults.length} tool_use_ids with duplicate results`);
+
+    // Create a map of messages to skip
+    const skipMessages = new Set<Anthropic.Messages.MessageParam>();
+
+    duplicateResults.forEach(([toolUseId, results]) => {
+      // Sort by content length (descending)
+      results.sort((a, b) => b.contentLength - a.contentLength);
+
+      // Skip all but the first (most detailed) result
+      for (let i = 1; i < results.length; i++) {
+        skipMessages.add(results[i].message);
+      }
+
+      console.log(`Selected 1 response out of ${results.length} for tool_use_id ${toolUseId}`);
+    });
+
+    // Filter out messages to skip
+    messageParams = messageParams.filter((msg) => !skipMessages.has(msg));
+  }
+
+  // Now proceed with normal grouping
   return messageParams.reduce((acc, message) => {
     const lastGroup = acc[acc.length - 1];
 
